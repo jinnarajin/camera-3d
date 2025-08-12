@@ -45,6 +45,21 @@ try:
         color_image = np.asanyarray(color_frame.get_data())
         depth_image = np.asanyarray(depth_frame.get_data())
 
+        #그리드 회색
+        h, w, _ = color_image.shape
+        grid_rows = 4  
+        grid_cols = 4 
+        grid_color = (128, 128, 128)  
+
+        for i in range(1, grid_rows):
+            y = int(h * i / grid_rows)
+            cv2.line(color_image, (0, y), (w, y), grid_color, 1)
+
+        for j in range(1, grid_cols):
+            x = int(w * j / grid_cols)
+            cv2.line(color_image, (x, 0), (x, h), grid_color, 1)
+
+
 
         img_rgb = cv2.cvtColor(color_image, cv2.COLOR_BGR2RGB)
         results = hands.process(img_rgb)
@@ -65,7 +80,7 @@ try:
             point_3d = rs.rs2_deproject_pixel_to_point(depth_intrin, [cx, cy], depth)  # [X, Y, Z]
 
 
-            cv2.circle(color_image, (cx, cy), 10, (0, 255, 255), -1)
+            
             X, Y, Z = point_3d 
             dispX, dispY = 1*X, -1*Y
             if depth <0.10:  # 자동적으로 18이하면 없어지긴한데 오류를 예방하기 위해
@@ -75,8 +90,15 @@ try:
                     status_text = "OK"
                     color = (0, 255, 0)  # 초록
 
+            # 한 칸 실제 크기 계산 (cm)
+            cell_width_cm = (w / grid_cols) * depth / depth_intrin.fx * 100
+            cell_height_cm = (h / grid_rows) * depth / depth_intrin.fy * 100
 
-            cv2.putText(color_image, f"{status_text}3D: X={dispX:.2f}m Y={dispY:.2f}m Z={Z:.2f}m",(10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
+            cv2.circle(color_image, (cx, cy), 10, (0, 255, 255), -1)
+
+            cv2.putText(color_image, f"{status_text} 3D: X={dispX:.2f}m Y={dispY:.2f}m Z={Z:.2f}m",(10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
+            cv2.putText(color_image,f"Cell Size: {cell_width_cm:.1f}cm x {cell_height_cm:.1f}cm",(10, 55), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (200, 200, 200), 2)
+
 
         cv2.imshow('RealSense Color Image', color_image)
         if cv2.waitKey(1) == 27:  # ESC 누르면 종료
