@@ -4,9 +4,6 @@ import numpy as np
 import cv2
 import mediapipe as mp
 
-
-
-
 pipeline = rs.pipeline()
 config = rs.config()
 config.enable_stream(rs.stream.depth, 640, 480, rs.format.z16, 30)
@@ -17,32 +14,22 @@ align = rs.align(rs.stream.color)
 device = pipeline_profile.get_device()
 depth_sensor = device.first_depth_sensor()
 
-depth_sensor.set_option(rs.option.laser_power, 84)       # 레이저 파워 낮춤
-depth_sensor.set_option(rs.option.receiver_gain, 18)     # 수신기 게인 높임
-depth_sensor.set_option(rs.option.min_distance, 0) # 최소 거리 250mm(0.25m)
+# depth_sensor.set_option(rs.option.laser_power, 84)       # 레이저 파워 낮춤
+# depth_sensor.set_option(rs.option.receiver_gain, 18)     # 수신기 게인 높임
+# depth_sensor.set_option(rs.option.min_distance, 0) # 최소 거리 250mm(0.25m) 수동
+
+depth_sensor.set_option(rs.option.visual_preset, rs.l500_visual_preset.short_range) #자동
+
 
 print("Short Range 설정이 적용되었습니다.")
+depth_intrin = pipeline_profile.get_stream(rs.stream.depth)\
+    .as_video_stream_profile().get_intrinsics()
 
 mp_hands = mp.solutions.hands
 hands = mp_hands.Hands(static_image_mode=False, max_num_hands=1)
 mp_draw = mp.solutions.drawing_utils
 
 print("손가락도 락이다.")
-
-
-def get_stable_depth(depth_frame, x, y, window=3):
-    h, w = depth_frame.get_height(), depth_frame.get_width()
-    total, count = 0, 0
-    half = window // 2
-    for dx in range(-half, half + 1):
-        for dy in range(-half, half + 1):
-            nx, ny = x + dx, y + dy
-            if 0 <= nx < w and 0 <= ny < h:
-                d = depth_frame.get_distance(nx, ny)
-                if d > 0:
-                    total += d
-                    count += 1
-    return total / count if count else 0
 
 try:
     while True:
@@ -69,25 +56,19 @@ try:
                 cx = int(hand_landmarks.landmark[8].x * w)
                 cy = int(hand_landmarks.landmark[8].y * h)
  
-                # cx = min(max(cx, 0), w - 1)
-                # cy = min(max(cy, 0), h - 1)
 
-            # depth = get_stable_depth(depth_frame, cx, cy)
             depth = depth_frame.get_distance(cx, cy)
+            if depth <= 0:
+                continue
             print(depth)
             
-            depth_intrin = depth_frame.profile.as_video_stream_profile().intrinsics
-
-        
             point_3d = rs.rs2_deproject_pixel_to_point(depth_intrin, [cx, cy], depth)  # [X, Y, Z]
 
 
             cv2.circle(color_image, (cx, cy), 10, (0, 255, 255), -1)
-
-            cx=1*point_3d[0]
-            cy=-1*point_3d[1]
-
-            if depth <0.10:  # 25cm 이하
+            X, Y, Z = point_3d 
+            dispX, dispY = 1*X, -1*Y
+            if depth <0.10:  # 자동적으로 18이하면 없어지긴한데 오류를 예방하기 위해
                     status_text = "Too Close!"
                     color = (0, 0, 255)  # 빨강
             else:
@@ -95,8 +76,7 @@ try:
                     color = (0, 255, 0)  # 초록
 
 
-            cv2.putText(color_image, f"{status_text}3D: X={cx:.2f}m Y={cy:.2f}m Z={point_3d[2]:.2f}m",(10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
-            # cv2.putText(color_image, f"3D: X={point_3d[0]:.2f}m Y={point_3d[1]:.2f}m Z={stable_z:.2f}m",(10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255,0,0), 2)
+            cv2.putText(color_image, f"{status_text}3D: X={dispX:.2f}m Y={dispY:.2f}m Z={Z:.2f}m",(10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
 
         cv2.imshow('RealSense Color Image', color_image)
         if cv2.waitKey(1) == 27:  # ESC 누르면 종료
