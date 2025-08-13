@@ -330,7 +330,7 @@ try:
                     target_base = anchor_base + delta_base
 
                     # 4) 현재 위치 읽고 속도 벡터 계산
-                    cur_base = np.array(rtde_r.getActualTCPPose()[:3], dtype=float)
+                    cur_base = np.array(rtde_r.getActualTCPPose()[:3], dtype=float)# 끝 좌표 tcp 맞추는게 tcp pose 6개 tool position xyz축각좌표 xyz축 거리 반대로  actual_q = rtde_r.getActualQ()는 joint position
                     v_vec = target_base - cur_base
 
                     # # 5) 속도 제한
@@ -339,13 +339,13 @@ try:
                     #     v_vec *= (V_CMD_MAX / (speed + 1e-9))
                     #     speed = V_CMD_MAX
 
-                    # # 6) 전송
-                    # try:
-                    #     rtde_c.speedL([v_vec[0], v_vec[1], v_vec[2], 0, 0, 0], 0.3, 0.1)
-                    # except Exception as e:
-                    #     # === FIX 3: y0 미정 위험 → 고정 y 사용 ===
-                    #     cv2.putText(color_image, f"[SIM] RTDE err: {e}", (10, 140),
-                    #                 cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0,0,255), 2)
+                    # 6) 전송
+                    try:
+                        rtde_c.speedL([v_vec[0], v_vec[1], v_vec[2], 0, 0, 0], 0.3, 0.1)
+                    except Exception as e:
+                        # === FIX 3: y0 미정 위험 → 고정 y 사용 ===
+                        cv2.putText(color_image, f"[SIM] RTDE err: {e}", (10, 140),
+                                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0,0,255), 2)
 
                 # # 속도 계산 (m/s)
                 #     if 'prev_pos' not in locals():
@@ -468,6 +468,8 @@ try:
         elif key == ord('r'):  # RESET
             ref_point = None
             started = False
+            rtde_c.moveL(cur_base, 0.3, 0.1)
+            
             anchor_cam  = None   # === ADDED
             anchor_base = None 
             if logging_enabled:    
