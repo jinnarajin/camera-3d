@@ -1,4 +1,3 @@
-
 import pyrealsense2 as rs
 import numpy as np
 import cv2
@@ -7,10 +6,22 @@ import time
 import csv
 import os
 import datetime
-# ======================= 2단계: 후처리/변환 유틸 =========================
 from collections import deque
 import math
 
+SIM_MODE=True
+UR_IP="127.0.0.1"
+V_CMD_MAX =0.25
+if SIM_MODE:
+    try:
+        from rtde_control import RTDEControlInterface as RTDEControl
+        from rtde_receive import RTDEReceiveInterface as RTDEReceive
+        rtde_c= RTDEControl(UR_IP)
+        rtde_r= RTDEReceive(UR_IP)
+        print("SIm 연결 ",UR_IP)
+    except Exception as e:
+        print("Sim import/connect error", e)
+        SIM_MODE=False
 
 class OutlierGate:
     """이상치 게이트: 깊이=0, 점프(속도) 과도, 범위 밖 제거"""
@@ -126,6 +137,7 @@ def pose_to_ur_tcp(p_base, fixed_rpy=(0, 3.1416, 0)):
        여기선 간단히 RPY를 axis-angle로 변환하지 않고 rx,ry,rz에 RPY를 직접 넣어두는 placeholder."""
     x, y, z = p_base
     rx, ry, rz = fixed_rpy  # 실제로는 RPY->axis-angle 변환 필요
+    rx +=10
     return [x, y, z, rx, ry, rz]
 # ======================================================================
 
@@ -138,14 +150,11 @@ align = rs.align(rs.stream.color)
 
 device = pipeline_profile.get_device()
 depth_sensor = device.first_depth_sensor()
-
 depth_sensor.set_option(rs.option.visual_preset, rs.l500_visual_preset.short_range) #자동
 
 print("Short Range 설정이 적용되었습니다.")
 depth_intrin = pipeline_profile.get_stream(rs.stream.depth)\
     .as_video_stream_profile().get_intrinsics()
-
-
 
 mp_hands = mp.solutions.hands
 hands = mp_hands.Hands(static_image_mode=False, max_num_hands=1)
@@ -177,8 +186,7 @@ def open_new_log():
     path = os.path.join("logs", fname)
     log_file = open(path, 'w', newline='', encoding='utf-8')
     log_writer = csv.writer(log_file)
-    log_writer.writerow(['ts', 'px', 'py', 'depth_m',
-                         'X', 'Y', 'Z', 'relX', 'relY', 'relZ', 'started'])
+    log_writer.writerow(['ts', 'px', 'py', 'depth_m', 'X', 'Y', 'Z', 'relX', 'relY', 'relZ', 'started'])
     print("logging to:", path)
 
 def close_log():
@@ -257,12 +265,10 @@ try:
             x = int(w * j / grid_cols)
             cv2.line(color_image, (x, 0), (x, h), grid_color, 1)
 
-        # --- 버튼 UI 그리기 ---
         btn_label = "START" if not started else "RESET (R)"
         cv2.rectangle(color_image, (BTN_X, BTN_Y), (BTN_X+BTN_W, BTN_Y+BTN_H), (80,80,80), -1)
         cv2.putText(color_image, btn_label, (BTN_X+8, BTN_Y+27),cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255,255,255), 2)
 
-         # === ADDED: REC 상태 점등 표시 ===
         rec_color = (0,0,255) if logging_enabled else (80,80,80)
         cv2.circle(color_image, (BTN_X+BTN_W+20, BTN_Y+20), 8, rec_color, -1)
         cv2.putText(color_image, "REC" if logging_enabled else "IDLE",
@@ -271,11 +277,9 @@ try:
         img_rgb = cv2.cvtColor(color_image, cv2.COLOR_BGR2RGB)
         results = hands.process(img_rgb)
 
-        overlay_lines = []  # 화면에 쓸 텍스트 라인
-
+        overlay_lines = []  
         if results.multi_hand_landmarks:
             for hand_landmarks in results.multi_hand_landmarks:
-                # MediaPipe 기준 검지 손가락 끝은 landmark #8
                 h, w, _ = color_image.shape
                 cx = int(hand_landmarks.landmark[8].x * w)
                 cy = int(hand_landmarks.landmark[8].y * h)
@@ -287,24 +291,16 @@ try:
                 
                 point_3d = rs.rs2_deproject_pixel_to_point(depth_intrin, [cx, cy], depth)  # [X, Y, Z]
                 X, Y, Z = point_3d 
-                # ======== (루프 내부) 2단계 처리 시작 ========
                 t_now = time.time()
                 raw =  np.array([X, Y, Z])
-                # 0) 이상치 게이트 (깊이 0/과속/범위 밖 제거)
                 if not gate.accept(t_now,raw):
-                    # 게이트 통과 못하면 표시만 하고 기록/로봇전달 스킵
                     pass
                 else:
                     raw = np.array([X, Y, Z])
-
-                    # 1) 1유로 필터 또는 EMA 선택 (하나만 써도 됨, 둘 다 써도 OK)
-                    sm1 = one_euro(t_now, raw)      # 반응성 필요시
-                    sm2 = ema(sm1)                  # 잔여 지터 추가 완화
-
-                    # 2) 속도 제한(안정성 강화)
+                    sm1 = one_euro(t_now, raw)     
+                    sm2 = ema(sm1)                 
+                   
                     smoothed = vel_limit(t_now, sm2)
-
-                    # 3) (선택) 상대좌표 적용
                     if started and ref_point is not None:
                         rel = smoothed - np.array(ref_point)
                     else:
@@ -316,35 +312,54 @@ try:
                     # 5) UR 명령 포맷으로 포장 (연동은 3단계에서)
                     ur_tcp = pose_to_ur_tcp(p_base)
                 # ======== (루프 내부) 2단계 처리 끝 ========
-                # 속도 계산 (m/s)
-                    if 'prev_pos' not in locals():
-                        prev_pos = smoothed
-                        prev_time = t_now
+
+                if SIM_MODE:
+                    if prev_pos_base is None:
+                        prev_pos_base = p_base.copy()
+                        prev_t_for_cmd = t_now
+                    dt_cmd = max(1e-6, t_now - prev_t_for_cmd)
+                    v_vec = (p_base - prev_pos_base) / dt_cmd
+                    speed = float(np.linalg.norm(v_vec))
+                    if speed > V_CMD_MAX:
+                        v_vec *= (V_CMD_MAX / (speed + 1e-9))
+                        speed = V_CMD_MAX
+                    # UR로 속도명령 전송
+                    try:
+                        rtde_c.speedL([v_vec[0], v_vec[1], v_vec[2], 0, 0, 0], 0.2, 0.1)
+                    except Exception as e:
+                        cv2.putText(color_image, f"[SIM] RTDE err: {e}", (10, 120),
+                                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0,0,255), 2)
+                # # 속도 계산 (m/s)
+                #     if 'prev_pos' not in locals():
+                #         prev_pos = smoothed
+                #         prev_time = t_now
+                #     else:
+                #         dt = t_now - prev_time
+                #         if dt > 0:
+                #             speed = np.linalg.norm(smoothed - prev_pos) / dt
+                #             prev_pos = smoothed
+                #             prev_time = t_now
+                    prev_pos_base=p_base.copy()
+                    prev_t_for_cmd=t_now
+                    # 현장 체크 표시
+                    if speed < 0.02:
+                        speed_status = "STOP"
+                        color = (0, 255, 0)
+                    elif speed < 0.2:
+                        speed_status = "SLOW"
+                        color = (255, 255, 0)
                     else:
-                        dt = t_now - prev_time
-                        if dt > 0:
-                            velocity = np.linalg.norm(smoothed - prev_pos) / dt
-                            prev_pos = smoothed
-                            prev_time = t_now
+                        speed_status = "FAST"
+                        color = (0, 0, 255)
 
-                            # 현장 체크 표시
-                            if velocity < 0.02:
-                                speed_status = "STOP"
-                                color = (0, 255, 0)
-                            elif velocity < 0.2:
-                                speed_status = "SLOW"
-                                color = (255, 255, 0)
-                            else:
-                                speed_status = "FAST"
-                                color = (0, 0, 255)
-
-                            # 화면 출력
-                            cv2.putText(color_image, f"{speed_status} ({velocity:.2f} m/s)",
-                                        (10, y0 + 80), cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
+                    # 화면 출력
+                    cv2.putText(color_image, f"{speed_status} ({speed :.2f} m/s)",
+                                (10, y0 + 80), cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
 
 
                 dispX, dispY = 1*X, -1*Y
                 last_XYZ=(X,Y,Z)
+
                 if pending_start:
                     ref_point = (X, Y, Z)
                     started = True
@@ -362,7 +377,7 @@ try:
                 else:
                         relX = relY = relZ = 0.0
 
-                if depth <0.10:  # 자동적으로 18이하면 없어지긴한데 오류를 예방하기 위해
+                if depth <0.25:  # 자동적으로 18이하면 없어지긴한데 오류를 예방하기 위해
                         status_text = "Too Close!"
                         color = (0, 0, 255)  # 빨강
                 else:
@@ -380,7 +395,6 @@ try:
                     overlay_lines.append(f"REL: dX={relX:.2f} dY={relY:.2f} dZ={relZ:.2f} m")
                 overlay_lines.append(f"Cell: {cell_width_cm:.1f} x {cell_height_cm:.1f} cm")
 
-                # === ADDED: REC 켠 동안에만 CSV 기록 ===
                 if logging_enabled and (log_writer is not None):
                     ts = time.time()
                     log_writer.writerow([ts, cx, cy, depth, X, Y, Z, relX, relY, relZ, int(started)])
@@ -397,6 +411,22 @@ try:
         for i, line in enumerate(overlay_lines[:3]):
             cv2.putText(color_image, line, (10, y0 + i*22),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.6, (220,220,220), 2)
+        if SIM_MODE:
+            speed = 3
+            acc = 0.8
+
+            actual_q = rtde_r.getActualQ()
+            print(f"Current joint positions: {actual_q}")
+
+            # rtde_c.moveJ(initial_joint, speed, acc)
+
+            # rtde_c.moveJ([-1.54, -1.83, -2.28, -0.59, 1.60, 0.023], speed, acc)
+            # rtde_c.moveL([-0.143, -0.435, 0.20, -0.001, 3.12, 0.04], speed, acc)
+            # rtde_c.moveL([-0.5745, -1.2669, -1.8607, -1.7440, 1.4003, 1.011], speed, acc)
+            rtde_c.moveL([0.8013, -0.3042, 0.1667, 1.940, -2.492, 2.591], speed, acc)
+
+            actual_q = rtde_r.getActualQ()
+            print(f"Current joint positions: {actual_q}")
 
         cv2.imshow('RealSense Color Image', color_image)
         key = cv2.waitKey(1) & 0xFF
@@ -413,14 +443,14 @@ try:
                     segment_id += 1
                     open_new_log()
             else:
-                pending_start = True  # ✅ 손이 아직 없으면 다음 유효 좌표 때 자동 시작      
+                pending_start = True  
         elif key == ord('r'):  # RESET
             ref_point = None
             started = False
-            if logging_enabled:     # ✅ REC가 켜져있으면
+            if logging_enabled:    
                 logging_enabled = False
                 close_log() 
-        elif key == ord('l'):  # === ADDED: REC 토글 ===
+        elif key == ord('l'):  
             logging_enabled = not logging_enabled
             if logging_enabled:
                 segment_id += 1
@@ -434,6 +464,9 @@ finally:
         close_log()
     except Exception:
         pass
+    if SIM_MODE:
+        try: rtde_c.stopScript()
+        except: pass
     pipeline.stop()
     cv2.destroyAllWindows()
     hands.close()
