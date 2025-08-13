@@ -9,19 +9,6 @@ import datetime
 from collections import deque
 import math
 
-# 카메라(오른쪽+, 위+, 멀어짐+) -> 로봇(X:멀어짐+, Y:왼쪽+, Z:위+)
-R_MAP = np.array([
-    [ 0,  0,  1],   # base.X = +cam.Z
-    [-1,  0,  0],   # base.Y = -cam.X
-    [ 0,  1,  0],   # base.Z = +cam.Y
-], dtype=float)
-
-# 축별 게인(안전/감속) 필요시 그대로 사용/튜닝
-SCALE = np.diag([0.5, 0.5, 0.5])
-
-anchor_cam  = None   # smoothed (3,)
-anchor_base = None   # rtde_r.getActualTCPPose()[:3]
-
 SIM_MODE=True
 UR_IP="127.0.0.1"
 V_CMD_MAX =0.25
@@ -139,7 +126,19 @@ T_base_cam = np.eye(4)  # placeholder (4x4)
 # R = np.eye(3); t = np.array([0.4, -0.1, 0.25])
 # T_base_cam[:3,:3] = R; T_base_cam[:3,3] = t
 
+def cam_to_base(p_cam):
+    """p_cam: (3,), meters -> p_base: (3,)"""
+    p = np.ones(4); p[:3] = p_cam
+    pb = T_base_cam @ p
+    return pb[:3]
 
+def pose_to_ur_tcp(p_base, fixed_rpy=(0, 3.1416, 0)):
+    """UR servo/speedL용 TCP 포맷 [x,y,z,rx,ry,rz] (회전은 고정 RPY->axis-angle 간단 근사)
+       여기선 간단히 RPY를 axis-angle로 변환하지 않고 rx,ry,rz에 RPY를 직접 넣어두는 placeholder."""
+    x, y, z = p_base
+    rx, ry, rz = fixed_rpy  # 실제로는 RPY->axis-angle 변환 필요
+    return [x, y, z, rx, ry, rz]
+# ======================================================================
 
 pipeline = rs.pipeline()
 config = rs.config()
@@ -205,7 +204,7 @@ def close_log():
 # 마우스 콜백: 버튼 클릭 처리
 def on_mouse(event, x, y, flags, param):
     # ✅ 추가: 전역 상태로 선언
-    global started, ref_point, last_XYZ, logging_enabled, segment_id, pending_start,anchor_cam,anchor_base  # <<< ADDED
+    global started, ref_point, last_XYZ, logging_enabled, segment_id, pending_start  # <<< ADDED
 
     if event == cv2.EVENT_LBUTTONDOWN:
         if BTN_X <= x <= BTN_X+BTN_W and BTN_Y <= y <= BTN_Y+BTN_H:
@@ -214,8 +213,6 @@ def on_mouse(event, x, y, flags, param):
                 if last_XYZ is not None:
                     ref_point = last_XYZ  # (X0, Y0, Z0)
                     started = True
-                    anchor_cam  = np.array(last_XYZ, dtype=float)
-                    anchor_base = np.array(rtde_r.getActualTCPPose()[:3])  
                     if not logging_enabled:
                         logging_enabled = True
                         segment_id += 1
@@ -290,63 +287,47 @@ try:
             depth = depth_frame.get_distance(cx, cy)
 
             if depth > 0:
+                
                 point_3d = rs.rs2_deproject_pixel_to_point(depth_intrin, [cx, cy], depth)  # [X, Y, Z]
                 X, Y, Z = point_3d 
                 t_now = time.time()
-                raw = np.array([X, Y, Z], dtype=float)
-
-                # === FIX 1: 게이트 통과 못하면 바로 스킵 (smoothed 미정 참조 방지) ===
-                if not gate.accept(t_now, raw):
-                    # 필요하면 여기서 화면 표시만 하고
-                    # cv2.putText(color_image, "Gated", (10, 140), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0,0,255), 2)
-                    continue
-
-                # 여기부터는 smoothed 보장
-                sm1 = one_euro(t_now, raw)
-                sm2 = ema(sm1)
-                smoothed = vel_limit(t_now, sm2)
-
-                if started and ref_point is not None:
-                    rel = smoothed - np.array(ref_point)
+                raw =  np.array([X, Y, Z])
+                if not gate.accept(t_now,raw):
+                    pass
                 else:
-                    rel = np.zeros(3)
+                    raw = np.array([X, Y, Z])
+                    sm1 = one_euro(t_now, raw)     
+                    sm2 = ema(sm1)                 
+                   
+                    smoothed = vel_limit(t_now, sm2)
+                    if started and ref_point is not None:
+                        rel = smoothed - np.array(ref_point)
+                    else:
+                        rel = np.zeros(3)
 
-                # # (옵션) 절대변환 쓰려면 유지
-                # p_base = cam_to_base(smoothed)   # TODO: 실제 T_base_cam
-                # ur_tcp = pose_to_ur_tcp(p_base)
+                    # 4) 로봇 베이스 좌표로 변환 (캘리브레이션 완료 후 활성화)
+                    p_base = cam_to_base(smoothed)  # TODO: T_base_cam 실제 값으로 교체
 
+                    # 5) UR 명령 포맷으로 포장 (연동은 3단계에서)
+                    ur_tcp = pose_to_ur_tcp(p_base)
                 # ======== (루프 내부) 2단계 처리 끝 ========
-                # print(1)  # 디버그용
 
-                # === FIX 2: SIM 제어 블록을 smoothed 계산 이후(=여기)로 이동 ===
-                if SIM_MODE and started and (anchor_cam is not None) and (anchor_base is not None):
-                    # 1) 카메라 좌표계 상대변위
-                    delta_cam = (smoothed - anchor_cam)  # (3,)
-
-                    # 2) 맵핑 + 스케일 → 로봇 베이스 상대변위
-                    delta_base = SCALE @ (R_MAP @ delta_cam)  # (3,)
-
-                    # 3) 목표 TCP 절대 위치
-                    target_base = anchor_base + delta_base
-
-                    # 4) 현재 위치 읽고 속도 벡터 계산
-                    cur_base = np.array(rtde_r.getActualTCPPose()[:3], dtype=float)
-                    v_vec = target_base - cur_base
-
-                    # # 5) 속도 제한
-                    # speed = float(np.linalg.norm(v_vec))
-                    # if speed > V_CMD_MAX:
-                    #     v_vec *= (V_CMD_MAX / (speed + 1e-9))
-                    #     speed = V_CMD_MAX
-
-                    # # 6) 전송
-                    # try:
-                    #     rtde_c.speedL([v_vec[0], v_vec[1], v_vec[2], 0, 0, 0], 0.3, 0.1)
-                    # except Exception as e:
-                    #     # === FIX 3: y0 미정 위험 → 고정 y 사용 ===
-                    #     cv2.putText(color_image, f"[SIM] RTDE err: {e}", (10, 140),
-                    #                 cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0,0,255), 2)
-
+                if SIM_MODE:
+                    if prev_pos_base is None:
+                        prev_pos_base = p_base.copy()
+                        prev_t_for_cmd = t_now
+                    dt_cmd = max(1e-6, t_now - prev_t_for_cmd)
+                    v_vec = (p_base - prev_pos_base) / dt_cmd
+                    speed = float(np.linalg.norm(v_vec))
+                    if speed > V_CMD_MAX:
+                        v_vec *= (V_CMD_MAX / (speed + 1e-9))
+                        speed = V_CMD_MAX
+                    # UR로 속도명령 전송
+                    try:
+                        rtde_c.speedL([v_vec[0], v_vec[1], v_vec[2], 0, 0, 0], 0.2, 0.1)
+                    except Exception as e:
+                        cv2.putText(color_image, f"[SIM] RTDE err: {e}", (10, 120),
+                                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0,0,255), 2)
                 # # 속도 계산 (m/s)
                 #     if 'prev_pos' not in locals():
                 #         prev_pos = smoothed
@@ -357,22 +338,22 @@ try:
                 #             speed = np.linalg.norm(smoothed - prev_pos) / dt
                 #             prev_pos = smoothed
                 #             prev_time = t_now
-                    # prev_pos_base=p_base.copy()
-                    # prev_t_for_cmd=t_now
-                    # # 현장 체크 표시
-                    # if speed < 0.02:
-                    #     speed_status = "STOP"
-                    #     color = (0, 255, 0)
-                    # elif speed < 0.2:
-                    #     speed_status = "SLOW"
-                    #     color = (255, 255, 0)
-                    # else:
-                    #     speed_status = "FAST"
-                    #     color = (0, 0, 255)
+                    prev_pos_base=p_base.copy()
+                    prev_t_for_cmd=t_now
+                    # 현장 체크 표시
+                    if speed < 0.02:
+                        speed_status = "STOP"
+                        color = (0, 255, 0)
+                    elif speed < 0.2:
+                        speed_status = "SLOW"
+                        color = (255, 255, 0)
+                    else:
+                        speed_status = "FAST"
+                        color = (0, 0, 255)
 
-                    # # 화면 출력
-                    # cv2.putText(color_image, f"{speed_status} ({speed :.2f} m/s)",
-                    #             (10, y0 + 80), cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
+                    # 화면 출력
+                    cv2.putText(color_image, f"{speed_status} ({speed :.2f} m/s)",
+                                (10, y0 + 80), cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
 
 
                 dispX, dispY = 1*X, -1*Y
@@ -429,23 +410,6 @@ try:
         for i, line in enumerate(overlay_lines[:3]):
             cv2.putText(color_image, line, (10, y0 + i*22),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.6, (220,220,220), 2)
-            
-        # if SIM_MODE: 테스트
-        #     speed = 3
-        #     acc = 0.8
-
-        #     actual_q = rtde_r.getActualQ()
-        #     print(f"Current joint positions: {actual_q}")
-
-        #     # rtde_c.moveJ(initial_joint, speed, acc)
-
-        #     # rtde_c.moveJ([-1.54, -1.83, -2.28, -0.59, 1.60, 0.023], speed, acc)
-        #     # rtde_c.moveL([-0.143, -0.435, 0.20, -0.001, 3.12, 0.04], speed, acc)
-        #     # rtde_c.moveL([-0.5745, -1.2669, -1.8607, -1.7440, 1.4003, 1.011], speed, acc)
-        #     rtde_c.moveL([0.8013, -0.3042, 0.1667, 1.940, -2.492, 2.591], speed, acc)
-
-        #     actual_q = rtde_r.getActualQ()
-        #     print(f"Current joint positions: {actual_q}") 
 
         cv2.imshow('RealSense Color Image', color_image)
         key = cv2.waitKey(1) & 0xFF
@@ -455,8 +419,6 @@ try:
             break
         elif key == ord('s'):  # START: 현재 좌표를 기준점으로 + 자동 REC ON
             if last_XYZ is not None:
-                anchor_cam  = np.array(last_XYZ, dtype=float)
-                anchor_base = np.array(rtde_r.getActualTCPPose()[:3])  
                 ref_point = last_XYZ
                 started = True
                 if not logging_enabled:
@@ -468,8 +430,6 @@ try:
         elif key == ord('r'):  # RESET
             ref_point = None
             started = False
-            anchor_cam  = None   # === ADDED
-            anchor_base = None 
             if logging_enabled:    
                 logging_enabled = False
                 close_log() 
@@ -490,9 +450,6 @@ finally:
     if SIM_MODE:
         try: rtde_c.stopScript()
         except: pass
-    anchor_cam  = None   # === ADDED
-    anchor_base = None   # === ADDED
     pipeline.stop()
     cv2.destroyAllWindows()
     hands.close()
-    
